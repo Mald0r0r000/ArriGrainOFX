@@ -21,7 +21,6 @@ typedef struct {
 
   // --- Parameters ---
   int formatSelect;
-  int stockSelect;
   int processSelect;
   float resScale;
   float animSpeed;
