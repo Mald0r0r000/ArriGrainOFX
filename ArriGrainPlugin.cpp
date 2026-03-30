@@ -59,7 +59,6 @@
 // Parameter name constants
 // ---------------------------------------------------------------------------
 #define P_FORMAT "formatSelect"
-#define P_STOCK "stockSelect"
 #define P_PROCESS "processSelect"
 #define P_RESSCALE "resScale"
 #define P_SPEED "animSpeed"
@@ -88,7 +87,7 @@ static OfxImageEffectSuiteV1 *gEffSuite = nullptr;
 // Instance data (parameter handles cached per instance)
 // ---------------------------------------------------------------------------
 struct InstData {
-  OfxParamHandle format, stock, process;
+  OfxParamHandle format, process;
   OfxParamHandle resScale, speed;
   OfxParamHandle fine, medium, coarse;
   OfxParamHandle amount, depth, softness;
@@ -235,14 +234,6 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle fx) {
   defChoice(ps, P_FORMAT, "Format", 2, formatOpts, 4,
             "Physical film format (grain size relative to frame)", "grpFilm");
 
-  const char *stockOpts[] = {
-      "Kodak Vision3 250D (5207)", "Kodak Vision3 500T (5219)",
-      "Kodak Vision3 200T (5213)", "Fuji Eterna 500T (8673)",
-      "Kodak Double-X B&W (5222)"};
-  defChoice(ps, P_STOCK, "Emulsion", 0, stockOpts, 5,
-            "Film emulsion type (H&D curves, cross-talk, grain response)",
-            "grpFilm");
-
   const char *processOpts[] = {"Classic", "Bleach Bypass", "Reversal"};
   defChoice(ps, P_PROCESS, "Process", 0, processOpts, 3,
             "Photochemical process (grain contrast character)", "grpFilm");
@@ -294,7 +285,6 @@ static OfxStatus actionCreateInstance(OfxImageEffectHandle fx) {
   InstData *d = new InstData;
 
   gParamSuite->paramGetHandle(ps, P_FORMAT, &d->format, nullptr);
-  gParamSuite->paramGetHandle(ps, P_STOCK, &d->stock, nullptr);
   gParamSuite->paramGetHandle(ps, P_PROCESS, &d->process, nullptr);
   gParamSuite->paramGetHandle(ps, P_RESSCALE, &d->resScale, nullptr);
   gParamSuite->paramGetHandle(ps, P_SPEED, &d->speed, nullptr);
@@ -398,8 +388,6 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
 
   gParamSuite->paramGetValueAtTime(d->format, time, &iv);
   gp.formatSelect = iv;
-  gParamSuite->paramGetValueAtTime(d->stock, time, &iv);
-  gp.stockSelect = iv;
   gParamSuite->paramGetValueAtTime(d->process, time, &iv);
   gp.processSelect = iv;
   gParamSuite->paramGetValueAtTime(d->resScale, time, &dv);
@@ -431,69 +419,7 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
   gParamSuite->paramGetValueAtTime(d->showMask, time, &iv);
   gp.showMask = iv;
 
-  // Setup color science data specific to the emulsion stock
-  static const float toe_data[5][3] = {
-      {0.08f, 0.06f, 0.10f}, // 250D
-      {0.12f, 0.09f, 0.16f}, // 500T
-      {0.10f, 0.07f, 0.13f}, // 200T
-      {0.11f, 0.07f, 0.13f}, // Fuji Eterna
-      {0.05f, 0.05f, 0.05f}  // B&W
-  };
-  static const float gamma_data[5][3] = {
-      {0.68f, 0.72f, 0.65f}, // 250D
-      {0.52f, 0.55f, 0.48f}, // 500T
-      {0.50f, 0.53f, 0.47f}, // 200T
-      {0.56f, 0.62f, 0.50f}, // Fuji Eterna
-      {0.78f, 0.78f, 0.78f}  // B&W
-  };
-  static const float shoulder_data[5][3] = {
-      {0.92f, 0.90f, 0.88f}, // 250D
-      {0.85f, 0.84f, 0.80f}, // 500T
-      {0.88f, 0.87f, 0.83f}, // 200T
-      {0.82f, 0.88f, 0.80f}, // Fuji Eterna
-      {0.88f, 0.88f, 0.88f}  // B&W
-  };
-  static const float crosstalk_data[5][9] = {
-      {0.95f, 0.03f, 0.02f, 0.01f, 0.97f, 0.02f, 0.02f, 0.04f, 0.94f}, // 250D
-      {0.93f, 0.04f, 0.03f, 0.02f, 0.96f, 0.02f, 0.04f, 0.06f, 0.90f}, // 500T
-      {0.94f, 0.04f, 0.02f, 0.01f, 0.97f, 0.02f, 0.03f, 0.05f, 0.92f}, // 200T
-      {0.94f, 0.03f, 0.03f, 0.02f, 0.98f, 0.00f, 0.03f, 0.05f,
-       0.92f}, // Fuji Eterna
-      {0.2126f, 0.7152f, 0.0722f, 0.2126f, 0.7152f, 0.0722f, 0.2126f, 0.7152f,
-       0.0722f} // B&W
-  };
-  static const float grainSize_data[5][3] = {
-      {0.45f, 0.40f, 0.55f}, // 250D
-      {0.70f, 0.62f, 0.80f}, // 500T
-      {0.38f, 0.33f, 0.45f}, // 200T
-      {0.65f, 0.60f, 0.72f}, // Fuji Eterna
-      {1.10f, 1.10f, 1.10f}  // B&W
-  };
-  static const float grainCorr_data[5][2] = {
-      {0.15f, 0.10f}, // 250D
-      {0.12f, 0.08f}, // 500T
-      {0.18f, 0.12f}, // 200T
-      {0.15f, 0.10f}, // Fuji Eterna
-      {0.30f, 0.30f}  // B&W
-  };
-
-  int s = gp.stockSelect;
-  if (s < 0 || s > 4)
-    s = 0;
-
-  for (int i = 0; i < 3; ++i) {
-    gp.toe[i] = toe_data[s][i];
-    gp.gamma[i] = gamma_data[s][i];
-    gp.shoulder[i] = shoulder_data[s][i];
-    gp.grainSize[i] = grainSize_data[s][i];
-  }
-  for (int i = 0; i < 9; ++i) {
-    gp.crosstalk[i] = crosstalk_data[s][i];
-  }
-  gp.grainCorr[0] = grainCorr_data[s][0];
-  gp.grainCorr[1] = grainCorr_data[s][1];
-
-  // --- Precalculate Performance Parameters (PERF-2) ---
+  // --- Precalculate Performance Parameters ---
   float format_scale = 1.0f;
   if (gp.formatSelect == 0) format_scale = 4.0f;
   else if (gp.formatSelect == 1) format_scale = 2.0f;
@@ -506,7 +432,7 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
   else if (gp.processSelect == 2) contrast_mod = 1.2f;
   gp.contrast_mod = contrast_mod;
 
-  gp.bw_mode = (gp.stockSelect == 4) ? 1.0f : 0.0f;
+  gp.bw_mode = 0.0f;
 
   // Dispatch Metal
   int result = RunMetalKernel(cmdQ, srcPtr, dstPtr, &gp);

@@ -29,7 +29,6 @@ struct GrainParams {
     int   srcRowBytes;
     int   dstRowBytes;
     int   formatSelect;
-    int   stockSelect;
     int   processSelect;
     float resScale;
     float animSpeed;
@@ -230,56 +229,103 @@ kernel void grainKernel(
     
     // Grain scale based on format
     float format_scale = params.format_scale;
-    float grain_size = 1.0f * format_scale * params.resScale;
+    float base_grain_size = 1.0f * format_scale * params.resScale;
+    
+    // SIZE MODULATION: Coarser grain in shadows, finer in highlights
+    // In shadows (low luma): grain_size is larger
+    // In highlights (high luma): grain_size is smaller
+    float shadow_size_boost = 1.0f + (1.0f - clamp(luma / 0.4f, 0.0f, 1.0f)) * 0.8f * params.shadowResponse;
+    float highlight_size_reduce = 1.0f - clamp((luma - 0.6f) / 0.4f, 0.0f, 1.0f) * 0.3f * params.highlightResponse;
+    float grain_size = base_grain_size * shadow_size_boost * highlight_size_reduce;
+    grain_size = max(grain_size, 0.1f); // Prevent division by zero
     
     // Time animation
     float zt = params.time * params.animSpeed;
     
-    // Generate grain using simplex noise (3 octaves)
+    // TEMPORAL COHERENCE: Different Z speeds per octave
+    // Fine grain changes rapidly, coarse clusters are more persistent
+    float zt_fine   = zt * 2.0f;   // fast
+    float zt_medium = zt * 0.7f;   // semi-persistent
+    float zt_coarse = zt * 0.25f;  // very persistent
+    
+    // Generate grain using simplex noise (3 octaves) - separate for each channel
     float px = float(imgX), py = float(imgY);
     
-    // Fine grain
-    float g1 = simplex3d(px/grain_size, py/grain_size, zt*2.0f, 0.0f);
-    // Medium grain
-    float g2 = simplex3d(px/(grain_size*2.0f), py/(grain_size*2.0f), zt*0.7f, 10.0f);
-    // Coarse grain
-    float g3 = simplex3d(px/(grain_size*4.0f), py/(grain_size*4.0f), zt*0.25f, 20.0f);
+    // Softness blur offset
+    float blur = params.grainSoftness * grain_size * 0.3f;
     
-    // Mix layers with normalization
+    // Channel seeds for color grain
+    float seedR = 0.0f;
+    float seedG = 10.0f;
+    float seedB = 20.0f;
+    
+    // Fine grain - R/G/B separate with softness (3-tap blur)
+    float gR1 = (simplex3d(px/grain_size, py/grain_size, zt_fine, seedR) +
+                 simplex3d((px+blur)/grain_size, (py+blur)/grain_size, zt_fine, seedR) +
+                 simplex3d((px-blur)/grain_size, (py-blur)/grain_size, zt_fine, seedR)) * 0.333f;
+    float gG1 = (simplex3d(px/grain_size, py/grain_size, zt_fine, seedG) +
+                 simplex3d((px+blur)/grain_size, (py+blur)/grain_size, zt_fine, seedG) +
+                 simplex3d((px-blur)/grain_size, (py-blur)/grain_size, zt_fine, seedG)) * 0.333f;
+    float gB1 = (simplex3d(px/grain_size, py/grain_size, zt_fine, seedB) +
+                 simplex3d((px+blur)/grain_size, (py+blur)/grain_size, zt_fine, seedB) +
+                 simplex3d((px-blur)/grain_size, (py-blur)/grain_size, zt_fine, seedB)) * 0.333f;
+    
+    // Medium grain
+    float ms = 2.0f;
+    float gR2 = simplex3d(px/(grain_size*ms), py/(grain_size*ms), zt_medium, seedR+30.0f);
+    float gG2 = simplex3d(px/(grain_size*ms), py/(grain_size*ms), zt_medium, seedG+30.0f);
+    float gB2 = simplex3d(px/(grain_size*ms), py/(grain_size*ms), zt_medium, seedB+30.0f);
+    
+    // Coarse grain
+    float cs = 4.0f;
+    float gR3 = simplex3d(px/(grain_size*cs), py/(grain_size*cs), zt_coarse, seedR+60.0f);
+    float gG3 = simplex3d(px/(grain_size*cs), py/(grain_size*cs), zt_coarse, seedG+60.0f);
+    float gB3 = simplex3d(px/(grain_size*cs), py/(grain_size*cs), zt_coarse, seedB+60.0f);
+    
+    // Mix layers with normalization - per channel
     float weight_sum = params.mixFine + params.mixMedium + params.mixCoarse;
     float norm = 1.0f / max(weight_sum, 0.001f);
-    float grain = (g1*params.mixFine + g2*params.mixMedium + g3*params.mixCoarse) * norm;
+    float grainR = (gR1*params.mixFine + gR2*params.mixMedium + gR3*params.mixCoarse) * norm;
+    float grainG = (gG1*params.mixFine + gG2*params.mixMedium + gG3*params.mixCoarse) * norm;
+    float grainB = (gB1*params.mixFine + gB2*params.mixMedium + gB3*params.mixCoarse) * norm;
     
-    // Apply bias and depth
-    grain *= params.biasR; // Use red bias as main
-    grain *= (1.0f + params.grainDepth * 2.0f) * params.contrast_mod;
-    grain = clamp(grain, -1.0f, 1.0f);
+    // Apply per-channel bias
+    grainR *= params.biasR;
+    grainG *= params.biasG;
+    grainB *= params.biasB;
+    
+    // Apply depth and contrast
+    float ct = (1.0f + params.grainDepth * 2.0f) * params.contrast_mod;
+    grainR = clamp(grainR * ct, -1.0f, 1.0f);
+    grainG = clamp(grainG * ct, -1.0f, 1.0f);
+    grainB = clamp(grainB * ct, -1.0f, 1.0f);
     
     // Calculate mask
     float mask = grain_mask(luma, params.shadowResponse, params.highlightResponse);
     mask *= params.globalAmt;
     
-    // Blend grain: grain_blend ranges from 0.5 (no effect) to 0 or 1 (full effect)
-    float grain_blend = 0.5f + grain * 0.5f * mask;
+    // Blend grain per channel
+    float blendR = 0.5f + grainR * 0.5f * mask;
+    float blendG = 0.5f + grainG * 0.5f * mask;
+    float blendB = 0.5f + grainB * 0.5f * mask;
     
-    // Soft light blend: when grain_blend=0.5, output=input
-    // when <0.5: darkens, when >0.5: lightens
-    float outR = (1.0f - 2.0f * grain_blend) * (R * R) + 2.0f * grain_blend * R;
-    float outG = (1.0f - 2.0f * grain_blend) * (G * G) + 2.0f * grain_blend * G;
-    float outB = (1.0f - 2.0f * grain_blend) * (B * B) + 2.0f * grain_blend * B;
+    // Soft light blend per channel
+    float outR = (1.0f - 2.0f * blendR) * (R * R) + 2.0f * blendR * R;
+    float outG = (1.0f - 2.0f * blendG) * (G * G) + 2.0f * blendG * G;
+    float outB = (1.0f - 2.0f * blendB) * (B * B) + 2.0f * blendB * B;
     
     // Debug modes
     if (params.showMask == 1) {
-        dst[di] = grain_blend;
-        dst[di+1] = grain_blend;
-        dst[di+2] = grain_blend;
+        dst[di] = blendR;
+        dst[di+1] = blendG;
+        dst[di+2] = blendB;
         dst[di+3] = A;
         return;
     }
     if (params.showMask == 2) {
-        dst[di] = grain + 0.5f;
-        dst[di+1] = grain + 0.5f;
-        dst[di+2] = grain + 0.5f;
+        dst[di] = grainR + 0.5f;
+        dst[di+1] = grainG + 0.5f;
+        dst[di+2] = grainB + 0.5f;
         dst[di+3] = A;
         return;
     }
