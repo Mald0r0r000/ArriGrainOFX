@@ -492,6 +492,21 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
   gp.grainCorr[0] = grainCorr_data[s][0];
   gp.grainCorr[1] = grainCorr_data[s][1];
 
+  // --- Precalculate Performance Parameters (PERF-2) ---
+  float format_scale = 1.0f;
+  if (gp.formatSelect == 0) format_scale = 4.0f;
+  else if (gp.formatSelect == 1) format_scale = 2.0f;
+  else if (gp.formatSelect == 2) format_scale = 1.0f;
+  else if (gp.formatSelect == 3) format_scale = 0.4f;
+  gp.format_scale = format_scale;
+
+  float contrast_mod = 1.0f;
+  if (gp.processSelect == 1) contrast_mod = 1.5f;
+  else if (gp.processSelect == 2) contrast_mod = 1.2f;
+  gp.contrast_mod = contrast_mod;
+
+  gp.bw_mode = (gp.stockSelect == 4) ? 1.0f : 0.0f;
+
   // Dispatch Metal
   int result = RunMetalKernel(cmdQ, srcPtr, dstPtr, &gp);
 

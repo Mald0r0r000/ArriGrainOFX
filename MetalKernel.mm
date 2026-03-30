@@ -6,6 +6,8 @@
 // This eliminates the need for a precompiled .metallib in the bundle.
 // The Metal runtime caches compiled pipelines, so subsequent launches
 // have near-zero overhead.
+//
+// NOTE: kKernelSource is the absolute single source of truth for the Metal shader.
 
 #include "MetalKernel.h"
 #import <Metal/Metal.h>
@@ -51,44 +53,131 @@ struct GrainParams {
     float crosstalk[9];
     float grainSize[3];
     float grainCorr[2]; // RG, GB correlation
+
+    // --- Precalculated Performance Parameters ---
+    float format_scale;
+    float contrast_mod;
+    float bw_mode;
 };
 
-// ===== NOISE (float precision to avoid spatial grid artifacts for px > 1024) =====
+// =====================================================================
+// OPENSIMPLEX2S NOISE 3D
+// Adapté pour Metal GPU — pas d'état global, pas de table de permutation
+// Utilise un hash entier PCG pour les gradients
+// =====================================================================
 
-inline float safe_fract_f(float x) { return x - floor(x); }
-inline float mix_f2(float a, float b, float t) { return a + t * (b - a); }
-
-inline float hash_3d_scalar(float x, float y, float z, float seed) {
-    float3 p3 = float3(x, y, z);
-    p3.x = safe_fract_f(p3.x * 0.1031f);
-    p3.y = safe_fract_f(p3.y * 0.1031f);
-    p3.z = safe_fract_f(p3.z * 0.1031f);
-    float dot_v = dot(p3, float3(p3.y + 33.33f, p3.z + 33.33f, p3.x + 33.33f));
-    p3 += dot_v;
-    return safe_fract_f((p3.x + p3.y) * p3.z + seed);
+// Hash PCG3D — qualité statistique supérieure au hash 0.1031
+inline uint3 pcg3d(uint3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
 }
 
-inline float noise_3d(float x, float y, float z, float seed) {
-    float ix = floor(x), iy = floor(y), iz = floor(z);
-    float fx = safe_fract_f(x), fy = safe_fract_f(y), fz = safe_fract_f(z);
-    float ux = fx * fx * (3.0f - 2.0f * fx);
-    float uy = fy * fy * (3.0f - 2.0f * fy);
-    float uz = fz * fz * (3.0f - 2.0f * fz);
-    float c000 = hash_3d_scalar(ix, iy, iz, seed);
-    float c100 = hash_3d_scalar(ix+1.0f, iy, iz, seed);
-    float c010 = hash_3d_scalar(ix, iy+1.0f, iz, seed);
-    float c110 = hash_3d_scalar(ix+1.0f, iy+1.0f, iz, seed);
-    float c001 = hash_3d_scalar(ix, iy, iz+1.0f, seed);
-    float c101 = hash_3d_scalar(ix+1.0f, iy, iz+1.0f, seed);
-    float c011 = hash_3d_scalar(ix, iy+1.0f, iz+1.0f, seed);
-    float c111 = hash_3d_scalar(ix+1.0f, iy+1.0f, iz+1.0f, seed);
-    float x00 = mix_f2(c000, c100, ux);
-    float x10 = mix_f2(c010, c110, ux);
-    float x01 = mix_f2(c001, c101, ux);
-    float x11 = mix_f2(c011, c111, ux);
-    float y0 = mix_f2(x00, x10, uy);
-    float y1 = mix_f2(x01, x11, uy);
-    return mix_f2(y0, y1, uz);
+// Gradient 3D depuis un hash entier — 12 gradients sur les arêtes du cube
+inline float grad3d(uint hash, float x, float y, float z) {
+    uint h = hash & 15u;
+    float u = (h < 8u)  ? x : y;
+    float v = (h < 4u)  ? y : ((h == 12u || h == 14u) ? x : z);
+    return ((h & 1u) ? -u : u) + ((h & 2u) ? -v : v);
+}
+
+// OpenSimplex2S 3D
+// Retourne une valeur dans [-1, 1], centrée sur 0
+inline float simplex3d(float x, float y, float z, float seed) {
+    // Skew vers la grille simplexe
+    const float F3 = 1.0f / 3.0f;
+    const float G3 = 1.0f / 6.0f;
+    
+    float s = (x + y + z) * F3;
+    int i = (int)floor(x + s);
+    int j = (int)floor(y + s);
+    int k = (int)floor(z + s);
+    
+    float t = (float)(i + j + k) * G3;
+    float x0 = x - ((float)i - t);
+    float y0 = y - ((float)j - t);
+    float z0 = z - ((float)k - t);
+    
+    // Déterminer le simplexe
+    int i1, j1, k1, i2, j2, k2;
+    if (x0 >= y0) {
+        if (y0 >= z0)      { i1=1; j1=0; k1=0; i2=1; j2=1; k2=0; }
+        else if (x0 >= z0) { i1=1; j1=0; k1=0; i2=1; j2=0; k2=1; }
+        else               { i1=0; j1=0; k1=1; i2=1; j2=0; k2=1; }
+    } else {
+        if (y0 < z0)       { i1=0; j1=0; k1=1; i2=0; j2=1; k2=1; }
+        else if (x0 < z0)  { i1=0; j1=1; k1=0; i2=0; j2=1; k2=1; }
+        else               { i1=0; j1=1; k1=0; i2=1; j2=1; k2=0; }
+    }
+    
+    float x1 = x0 - (float)i1 + G3;
+    float y1 = y0 - (float)j1 + G3;
+    float z1 = z0 - (float)k1 + G3;
+    float x2 = x0 - (float)i2 + 2.0f*G3;
+    float y2 = y0 - (float)j2 + 2.0f*G3;
+    float z2 = z0 - (float)k2 + 2.0f*G3;
+    float x3 = x0 - 1.0f + 3.0f*G3;
+    float y3 = y0 - 1.0f + 3.0f*G3;
+    float z3 = z0 - 1.0f + 3.0f*G3;
+    
+    // Seed intégré dans le hash via offset entier
+    int si = (int)(seed * 1000.0f);
+    
+    // Contributions des 4 coins
+    float n = 0.0f;
+    
+    float t0 = 0.6f - x0*x0 - y0*y0 - z0*z0;
+    if (t0 > 0.0f) {
+        uint3 h0 = pcg3d(uint3(i + si, j, k));
+        t0 *= t0;
+        n += t0*t0 * grad3d(h0.x, x0, y0, z0);
+    }
+    float t1 = 0.6f - x1*x1 - y1*y1 - z1*z1;
+    if (t1 > 0.0f) {
+        uint3 h1 = pcg3d(uint3(i+i1 + si, j+j1, k+k1));
+        t1 *= t1;
+        n += t1*t1 * grad3d(h1.x, x1, y1, z1);
+    }
+    float t2 = 0.6f - x2*x2 - y2*y2 - z2*z2;
+    if (t2 > 0.0f) {
+        uint3 h2 = pcg3d(uint3(i+i2 + si, j+j2, k+k2));
+        t2 *= t2;
+        n += t2*t2 * grad3d(h2.x, x2, y2, z2);
+    }
+    float t3 = 0.6f - x3*x3 - y3*y3 - z3*z3;
+    if (t3 > 0.0f) {
+        uint3 h3 = pcg3d(uint3(i+1 + si, j+1, k+1));
+        t3 *= t3;
+        n += t3*t3 * grad3d(h3.x, x3, y3, z3);
+    }
+    
+    // Normaliser vers [-1, 1]
+    return clamp(n * 32.0f, -1.0f, 1.0f);
+}
+
+inline float grain_mask(float luma, float shadow_r, float highlight_r) {
+    // Courbe en cloche asymétrique centrée sur les ombres
+    float peak = 0.22f;
+    float width_low  = 0.20f;  // flanc gauche (vers les noirs)
+    float width_high = 0.45f;  // flanc droit (vers les hautes lumières)
+    
+    float width = (luma < peak) ? width_low : width_high;
+    float bell = exp(-((luma - peak) * (luma - peak)) 
+                    / (2.0f * width * width));
+    
+    // Plancher dans les noirs — le grain ne disparaît jamais totalement
+    float floor_val = 0.12f * shadow_r;
+    
+    // Plafond dans les hautes lumières contrôlé par highlightResponse
+    float ceiling = 1.0f - (luma * (1.0f - highlight_r));
+    
+    return clamp(max(floor_val, bell) * ceiling, 0.0f, 1.0f);
 }
 
 // ===== FILM RESPONSE & CROSS-TALK =====
@@ -136,36 +225,37 @@ kernel void grainKernel(
     float R = src[si], G = src[si+1], B = src[si+2], A = src[si+3];
 
     // ----- 1. COLOR SCIENCE: H&D Curves & Cross-talk -----
-    float r_resp = R, g_resp = G, b_resp = B;
-    if (params.stockSelect == 4) { // Double-X B&W
-        float luma = 0.2126f*R + 0.7152f*G + 0.0722f*B;
-        float luma_resp = apply_hd_curve(luma, params.toe[0], params.gamma[0], params.shoulder[0]);
-        r_resp = g_resp = b_resp = luma_resp;
-    } else {
-        r_resp = apply_hd_curve(R, params.toe[0], params.gamma[0], params.shoulder[0]);
-        g_resp = apply_hd_curve(G, params.toe[1], params.gamma[1], params.shoulder[1]);
-        b_resp = apply_hd_curve(B, params.toe[2], params.gamma[2], params.shoulder[2]);
-    }
+    float r_hdr = apply_hd_curve(R, params.toe[0], params.gamma[0], params.shoulder[0]);
+    float g_hdr = apply_hd_curve(G, params.toe[1], params.gamma[1], params.shoulder[1]);
+    float b_hdr = apply_hd_curve(B, params.toe[2], params.gamma[2], params.shoulder[2]);
+    
+    float luma = 0.2126f*R + 0.7152f*G + 0.0722f*B;
+    float luma_resp = apply_hd_curve(luma, params.toe[0], params.gamma[0], params.shoulder[0]);
+
+    float r_resp = mix_f(r_hdr, luma_resp, params.bw_mode);
+    float g_resp = mix_f(g_hdr, luma_resp, params.bw_mode);
+    float b_resp = mix_f(b_hdr, luma_resp, params.bw_mode);
     
     float3 color_resp = apply_crosstalk(float3(r_resp, g_resp, b_resp), params.crosstalk);
     r_resp = color_resp.r; g_resp = color_resp.g; b_resp = color_resp.b;
 
-    // Luma drive for grain blending (more visible in midtones/shadows)
-    float luma_drive = 0.2126f*r_resp + 0.7152f*g_resp + 0.0722f*b_resp;
+    // Luma raw for grain mask & size modulation
+    float luma_raw = 0.2126f*r_resp + 0.7152f*g_resp + 0.0722f*b_resp;
 
     // ----- 2. GRAIN GENERATION -----
-    float format_scale = 1.0f;
-    if (params.formatSelect == 0) format_scale = 4.0f;        // 8mm
-    else if (params.formatSelect == 1) format_scale = 2.0f;   // 16mm
-    else if (params.formatSelect == 2) format_scale = 1.0f;   // 35mm
-    else if (params.formatSelect == 3) format_scale = 0.4f;   // 70mm / IMAX
+    float format_scale = params.format_scale;
+
+    // Modulate grain size in shadows [QUAL-4]
+    float shadow_size_boost = 1.0f + 
+        (1.0f - clamp(luma_raw / 0.4f, 0.0f, 1.0f)) 
+        * 0.35f * params.shadowResponse;
 
     // Scale noise independent per channel
-    float final_scale_R = max(0.1f, format_scale * params.grainSize[0] * params.resScale);
-    float final_scale_G = max(0.1f, format_scale * params.grainSize[1] * params.resScale);
-    float final_scale_B = max(0.1f, format_scale * params.grainSize[2] * params.resScale);
+    float final_scale_R = max(0.1f, format_scale * params.grainSize[0] * params.resScale * shadow_size_boost);
+    float final_scale_G = max(0.1f, format_scale * params.grainSize[1] * params.resScale * shadow_size_boost);
+    float final_scale_B = max(0.1f, format_scale * params.grainSize[2] * params.resScale * shadow_size_boost);
 
-    float zt = params.time * params.animSpeed;
+    float zt_base = params.time * params.animSpeed;
     float px = float(imgX), py = float(imgY);
 
     float pxR = px / final_scale_R, pyR = py / final_scale_R;
@@ -174,23 +264,38 @@ kernel void grainKernel(
 
     float oR = 0.0f, oG = 521.3f, oB = 194.2f;
 
+    // Differential temporal octaves [QUAL-5]
+    float zt_fine   = zt_base * 2.0f;
+    float zt_medium = zt_base * 0.7f;
+    float zt_coarse = zt_base * 0.25f;
+
+    // Center + 2 diagonals spatial taps [QUAL-7] (limited to 3 taps for cost since PERF-1 texture is removed)
+    float blur_r = params.grainSoftness * final_scale_R * 0.3f;
+    float blur_g = params.grainSoftness * final_scale_G * 0.3f;
+    float blur_b = params.grainSoftness * final_scale_B * 0.3f;
+
+    // Function macro to compute 3-tap blurred simplex noise
+    #define SIMPLEX_3TAP(PX, PY, ZT, SEED, BLUR) \
+        ((simplex3d(PX, PY, ZT, SEED) + \
+          simplex3d(PX + BLUR, PY + BLUR, ZT, SEED) + \
+          simplex3d(PX - BLUR, PY - BLUR, ZT, SEED)) * 0.333333f * 0.5f)
+
     // Fine
-    float fz = zt*2.0f;
-    float nr1=noise_3d(pxR, pyR, fz+oR, 0.0f)-0.5f;
-    float ng1=noise_3d(pxG, pyG, fz+oG, 10.0f)-0.5f;
-    float nb1=noise_3d(pxB, pyB, fz+oB, 20.0f)-0.5f;
+    float nr1 = SIMPLEX_3TAP(pxR, pyR, zt_fine+oR, 0.0f);
+    float ng1 = SIMPLEX_3TAP(pxG, pyG, zt_fine+oG, 10.0f);
+    float nb1 = SIMPLEX_3TAP(pxB, pyB, zt_fine+oB, 20.0f);
 
     // Medium
     float ms=2.0f;
-    float nr2=noise_3d(pxR/ms, pyR/ms, zt+oR, 30.0f)-0.5f;
-    float ng2=noise_3d(pxG/ms, pyG/ms, zt+oG, 40.0f)-0.5f;
-    float nb2=noise_3d(pxB/ms, pyB/ms, zt+oB, 50.0f)-0.5f;
+    float nr2 = SIMPLEX_3TAP(pxR/ms, pyR/ms, zt_medium+oR, 30.0f);
+    float ng2 = SIMPLEX_3TAP(pxG/ms, pyG/ms, zt_medium+oG, 40.0f);
+    float nb2 = SIMPLEX_3TAP(pxB/ms, pyB/ms, zt_medium+oB, 50.0f);
 
     // Coarse
     float cs=4.0f;
-    float nr3=noise_3d(pxR/cs, pyR/cs, zt+oR, 60.0f)-0.5f;
-    float ng3=noise_3d(pxG/cs, pyG/cs, zt+oG, 70.0f)-0.5f;
-    float nb3=noise_3d(pxB/cs, pyB/cs, zt+oB, 80.0f)-0.5f;
+    float nr3 = SIMPLEX_3TAP(pxR/cs, pyR/cs, zt_coarse+oR, 60.0f);
+    float ng3 = SIMPLEX_3TAP(pxG/cs, pyG/cs, zt_coarse+oG, 70.0f);
+    float nb3 = SIMPLEX_3TAP(pxB/cs, pyB/cs, zt_coarse+oB, 80.0f);
 
     // Layer mixing
     float nr = nr1*params.mixFine + nr2*params.mixMedium + nr3*params.mixCoarse;
@@ -207,20 +312,16 @@ kernel void grainKernel(
     noiseG *= params.biasG; 
     noiseB *= params.biasB;
 
-    float sf = 1.0f-(params.grainSoftness*0.5f);
-    noiseR*=sf; noiseG*=sf; noiseB*=sf;
-    
     // Contrast: grain_depth slider × process modifier
-    float contrast_mod = 1.0f;
-    if (params.processSelect == 1) contrast_mod = 1.5f;       // Bleach Bypass
-    else if (params.processSelect == 2) contrast_mod = 1.2f;  // Reversal
+    float contrast_mod = params.contrast_mod;
     
     float ct = (1.0f+(params.grainDepth*2.0f)) * contrast_mod;
     noiseR=clamp(noiseR*ct,-0.5f,0.5f);
     noiseG=clamp(noiseG*ct,-0.5f,0.5f);
     noiseB=clamp(noiseB*ct,-0.5f,0.5f);
 
-    float im = luma_drive * params.globalAmt;
+    // [QUAL-3] Correct Luma Masking (bell curve in shadows, ceiling in highlights)
+    float im = grain_mask(luma_raw, params.shadowResponse, params.highlightResponse) * params.globalAmt;
     float nrn=mix_f(0.5f, noiseR+0.5f, im);
     float ngn=mix_f(0.5f, noiseG+0.5f, im);
     float nbn=mix_f(0.5f, noiseB+0.5f, im);
@@ -240,54 +341,103 @@ kernel void grainKernel(
 }
 )MSL";
 
+#include <os/lock.h>
+
+// ---------------------------------------------------------------------------
+// CPU-side PCG3D random generation for noise texture
+// ---------------------------------------------------------------------------
+static inline float pcg3d_scalar(uint32_t x, uint32_t y, uint32_t z) {
+    simd_uint3 v = simd_make_uint3(x % 64, y % 64, z % 64);
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return (float)v.x * (1.0f / (float)0xffffffffu);
+}
+
 // ---------------------------------------------------------------------------
 // Cached pipeline state
 // ---------------------------------------------------------------------------
 static id<MTLComputePipelineState> s_Pipeline = nil;
 static id<MTLDevice> s_Device = nil;
-static dispatch_once_t s_OnceToken;
+static id<MTLTexture> s_NoiseTex = nil;
+static os_unfair_lock s_PipelineLock = OS_UNFAIR_LOCK_INIT;
 
 static bool ensurePipeline(id<MTLDevice> device) {
-  if (s_Pipeline && s_Device == device)
+  os_unfair_lock_lock(&s_PipelineLock);
+
+  if (s_Pipeline && s_Device == device) {
+    os_unfair_lock_unlock(&s_PipelineLock);
     return true;
+  }
 
-  __block bool success = false;
-  dispatch_once(&s_OnceToken, ^{
-    @autoreleasepool {
-      NSError *error = nil;
-      MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-      opts.fastMathEnabled = YES;
-      opts.languageVersion = MTLLanguageVersion2_4;
+  bool success = false;
+  @autoreleasepool {
+    NSError *error = nil;
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.fastMathEnabled = YES;
+    opts.languageVersion = MTLLanguageVersion2_4;
 
-      id<MTLLibrary> lib = [device newLibraryWithSource:kKernelSource
-                                                options:opts
-                                                  error:&error];
-      if (!lib) {
-        NSLog(@"[ArriGrain] Metal compile error: %@", error);
-        return;
-      }
-
-      id<MTLFunction> func = [lib newFunctionWithName:@"grainKernel"];
-      if (!func) {
-        NSLog(@"[ArriGrain] grainKernel function not found");
-        return;
-      }
-
-      s_Pipeline = [device newComputePipelineStateWithFunction:func
-                                                         error:&error];
-      if (!s_Pipeline) {
-        NSLog(@"[ArriGrain] Pipeline error: %@", error);
-        return;
-      }
-
-      s_Device = device;
-      NSLog(@"[ArriGrain] Metal pipeline ready (threads/group: %lu)",
-            (unsigned long)s_Pipeline.maxTotalThreadsPerThreadgroup);
-      success = true;
+    id<MTLLibrary> lib = [device newLibraryWithSource:kKernelSource
+                                              options:opts
+                                                error:&error];
+    if (!lib) {
+      NSLog(@"[ArriGrain] Metal compile error: %@", error);
+      os_unfair_lock_unlock(&s_PipelineLock);
+      return false;
     }
-  });
 
-  return s_Pipeline != nil;
+    id<MTLFunction> func = [lib newFunctionWithName:@"grainKernel"];
+    if (!func) {
+      NSLog(@"[ArriGrain] grainKernel function not found");
+      os_unfair_lock_unlock(&s_PipelineLock);
+      return false;
+    }
+
+    s_Pipeline = [device newComputePipelineStateWithFunction:func
+                                                       error:&error];
+    if (!s_Pipeline) {
+      NSLog(@"[ArriGrain] Pipeline error: %@", error);
+      os_unfair_lock_unlock(&s_PipelineLock);
+      return false;
+    }
+
+    if (!s_NoiseTex || s_Device != device) {
+      MTLTextureDescriptor *texDesc = [[MTLTextureDescriptor alloc] init];
+      texDesc.textureType = MTLTextureType3D;
+      texDesc.pixelFormat = MTLPixelFormatR32Float;
+      texDesc.width = 64;
+      texDesc.height = 64;
+      texDesc.depth = 64;
+      texDesc.mipmapLevelCount = 1;
+      texDesc.usage = MTLTextureUsageShaderRead;
+      s_NoiseTex = [device newTextureWithDescriptor:texDesc];
+        
+      float *noiseData = (float*)malloc(64 * 64 * 64 * sizeof(float));
+      for (uint32_t z = 0; z < 64; z++) {
+        for (uint32_t y = 0; y < 64; y++) {
+          for (uint32_t x = 0; x < 64; x++) {
+            noiseData[z*64*64 + y*64 + x] = pcg3d_scalar(x, y, z);
+          }
+        }
+      }
+      MTLRegion region = MTLRegionMake3D(0, 0, 0, 64, 64, 64);
+      [s_NoiseTex replaceRegion:region mipmapLevel:0 slice:0 withBytes:noiseData bytesPerRow:64 * sizeof(float) bytesPerImage:64 * 64 * sizeof(float)];
+      free(noiseData);
+    }
+
+    s_Device = device;
+    NSLog(@"[ArriGrain] Metal pipeline ready (threads/group: %lu)",
+          (unsigned long)s_Pipeline.maxTotalThreadsPerThreadgroup);
+    success = true;
+  }
+  
+  os_unfair_lock_unlock(&s_PipelineLock);
+  return success;
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,11 @@ typedef struct {
   float crosstalk[9];
   float grainSize[3];
   float grainCorr[2]; // RG, GB correlation
+
+  // --- Precalculated Performance Parameters ---
+  float format_scale;
+  float contrast_mod;
+  float bw_mode;
 } GrainParams;
 
 // Returns 0 on success (kOfxStatOK)
