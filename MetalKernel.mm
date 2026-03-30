@@ -172,7 +172,8 @@ inline float grain_mask(float luma, float shadow_r, float highlight_r) {
                     / (2.0f * width * width));
     
     // Plancher dans les noirs — le grain ne disparaît jamais totalement
-    float floor_val = 0.12f * shadow_r;
+    // Raised from 0.12f to 0.25f to ensure grain visibility across all luminance values
+    float floor_val = 0.25f * shadow_r;
     
     // Plafond dans les hautes lumières contrôlé par highlightResponse
     float ceiling = 1.0f - (luma * (1.0f - highlight_r));
@@ -223,120 +224,91 @@ kernel void grainKernel(
     int di = (int)gid.y * dstPPR + (int)gid.x * 4;
 
     float R = src[si], G = src[si+1], B = src[si+2], A = src[si+3];
-
-    // ----- 1. COLOR SCIENCE: H&D Curves & Cross-talk -----
-    float r_hdr = apply_hd_curve(R, params.toe[0], params.gamma[0], params.shoulder[0]);
-    float g_hdr = apply_hd_curve(G, params.toe[1], params.gamma[1], params.shoulder[1]);
-    float b_hdr = apply_hd_curve(B, params.toe[2], params.gamma[2], params.shoulder[2]);
     
+    // Calculate luma for mask
     float luma = 0.2126f*R + 0.7152f*G + 0.0722f*B;
-    float luma_resp = apply_hd_curve(luma, params.toe[0], params.gamma[0], params.shoulder[0]);
-
-    float r_resp = mix_f(r_hdr, luma_resp, params.bw_mode);
-    float g_resp = mix_f(g_hdr, luma_resp, params.bw_mode);
-    float b_resp = mix_f(b_hdr, luma_resp, params.bw_mode);
     
-    float3 color_resp = apply_crosstalk(float3(r_resp, g_resp, b_resp), params.crosstalk);
-    r_resp = color_resp.r; g_resp = color_resp.g; b_resp = color_resp.b;
-
-    // Luma raw for grain mask & size modulation
-    float luma_raw = 0.2126f*r_resp + 0.7152f*g_resp + 0.0722f*b_resp;
-
-    // ----- 2. GRAIN GENERATION -----
+    // Grain scale based on format
     float format_scale = params.format_scale;
-
-    // Modulate grain size in shadows [QUAL-4]
-    float shadow_size_boost = 1.0f + 
-        (1.0f - clamp(luma_raw / 0.4f, 0.0f, 1.0f)) 
-        * 0.35f * params.shadowResponse;
-
-    // Scale noise independent per channel
-    float final_scale_R = max(0.1f, format_scale * params.grainSize[0] * params.resScale * shadow_size_boost);
-    float final_scale_G = max(0.1f, format_scale * params.grainSize[1] * params.resScale * shadow_size_boost);
-    float final_scale_B = max(0.1f, format_scale * params.grainSize[2] * params.resScale * shadow_size_boost);
-
-    float zt_base = params.time * params.animSpeed;
-    float px = float(imgX), py = float(imgY);
-
-    float pxR = px / final_scale_R, pyR = py / final_scale_R;
-    float pxG = px / final_scale_G, pyG = py / final_scale_G;
-    float pxB = px / final_scale_B, pyB = py / final_scale_B;
-
-    float oR = 0.0f, oG = 521.3f, oB = 194.2f;
-
-    // Differential temporal octaves [QUAL-5]
-    float zt_fine   = zt_base * 2.0f;
-    float zt_medium = zt_base * 0.7f;
-    float zt_coarse = zt_base * 0.25f;
-
-    // Center + 2 diagonals spatial taps [QUAL-7] (limited to 3 taps for cost since PERF-1 texture is removed)
-    float blur_r = params.grainSoftness * final_scale_R * 0.3f;
-    float blur_g = params.grainSoftness * final_scale_G * 0.3f;
-    float blur_b = params.grainSoftness * final_scale_B * 0.3f;
-
-    // Function macro to compute 3-tap blurred simplex noise
-    #define SIMPLEX_3TAP(PX, PY, ZT, SEED, BLUR) \
-        ((simplex3d(PX, PY, ZT, SEED) + \
-          simplex3d(PX + BLUR, PY + BLUR, ZT, SEED) + \
-          simplex3d(PX - BLUR, PY - BLUR, ZT, SEED)) * 0.333333f * 0.5f)
-
-    // Fine
-    float nr1 = SIMPLEX_3TAP(pxR, pyR, zt_fine+oR, 0.0f);
-    float ng1 = SIMPLEX_3TAP(pxG, pyG, zt_fine+oG, 10.0f);
-    float nb1 = SIMPLEX_3TAP(pxB, pyB, zt_fine+oB, 20.0f);
-
-    // Medium
-    float ms=2.0f;
-    float nr2 = SIMPLEX_3TAP(pxR/ms, pyR/ms, zt_medium+oR, 30.0f);
-    float ng2 = SIMPLEX_3TAP(pxG/ms, pyG/ms, zt_medium+oG, 40.0f);
-    float nb2 = SIMPLEX_3TAP(pxB/ms, pyB/ms, zt_medium+oB, 50.0f);
-
-    // Coarse
-    float cs=4.0f;
-    float nr3 = SIMPLEX_3TAP(pxR/cs, pyR/cs, zt_coarse+oR, 60.0f);
-    float ng3 = SIMPLEX_3TAP(pxG/cs, pyG/cs, zt_coarse+oG, 70.0f);
-    float nb3 = SIMPLEX_3TAP(pxB/cs, pyB/cs, zt_coarse+oB, 80.0f);
-
-    // Layer mixing
-    float nr = nr1*params.mixFine + nr2*params.mixMedium + nr3*params.mixCoarse;
-    float ng = ng1*params.mixFine + ng2*params.mixMedium + ng3*params.mixCoarse;
-    float nb = nb1*params.mixFine + nb2*params.mixMedium + nb3*params.mixCoarse;
-
-    // Correlation (Cross-channel grain mixing)
-    float noiseR = nr;
-    float noiseG = mix_f(ng, nr, params.grainCorr[0]);
-    float noiseB = mix_f(nb, ng, params.grainCorr[1]);
-
-    // RGB bias sliders
-    noiseR *= params.biasR; 
-    noiseG *= params.biasG; 
-    noiseB *= params.biasB;
-
-    // Contrast: grain_depth slider × process modifier
-    float contrast_mod = params.contrast_mod;
+    float grain_size = 1.0f * format_scale * params.resScale;
     
-    float ct = (1.0f+(params.grainDepth*2.0f)) * contrast_mod;
-    noiseR=clamp(noiseR*ct,-0.5f,0.5f);
-    noiseG=clamp(noiseG*ct,-0.5f,0.5f);
-    noiseB=clamp(noiseB*ct,-0.5f,0.5f);
-
-    // [QUAL-3] Correct Luma Masking (bell curve in shadows, ceiling in highlights)
-    float im = grain_mask(luma_raw, params.shadowResponse, params.highlightResponse) * params.globalAmt;
-    float nrn=mix_f(0.5f, noiseR+0.5f, im);
-    float ngn=mix_f(0.5f, noiseG+0.5f, im);
-    float nbn=mix_f(0.5f, noiseB+0.5f, im);
-
-    if (params.showMask == 1) { 
-        dst[di]   = nrn; 
-        dst[di+1] = ngn; 
-        dst[di+2] = nbn; 
-        dst[di+3] = A; 
-        return; 
+    // Time animation
+    float zt = params.time * params.animSpeed;
+    
+    // Generate grain using simplex noise (3 octaves)
+    float px = float(imgX), py = float(imgY);
+    
+    // Fine grain
+    float g1 = simplex3d(px/grain_size, py/grain_size, zt*2.0f, 0.0f);
+    // Medium grain
+    float g2 = simplex3d(px/(grain_size*2.0f), py/(grain_size*2.0f), zt*0.7f, 10.0f);
+    // Coarse grain
+    float g3 = simplex3d(px/(grain_size*4.0f), py/(grain_size*4.0f), zt*0.25f, 20.0f);
+    
+    // Mix layers with normalization
+    float weight_sum = params.mixFine + params.mixMedium + params.mixCoarse;
+    float norm = 1.0f / max(weight_sum, 0.001f);
+    float grain = (g1*params.mixFine + g2*params.mixMedium + g3*params.mixCoarse) * norm;
+    
+    // Apply bias and depth
+    grain *= params.biasR; // Use red bias as main
+    grain *= (1.0f + params.grainDepth * 2.0f) * params.contrast_mod;
+    grain = clamp(grain, -1.0f, 1.0f);
+    
+    // Calculate mask
+    float mask = grain_mask(luma, params.shadowResponse, params.highlightResponse);
+    mask *= params.globalAmt;
+    
+    // Blend grain: grain_blend ranges from 0.5 (no effect) to 0 or 1 (full effect)
+    float grain_blend = 0.5f + grain * 0.5f * mask;
+    
+    // Soft light blend: when grain_blend=0.5, output=input
+    // when <0.5: darkens, when >0.5: lightens
+    float outR = (1.0f - 2.0f * grain_blend) * (R * R) + 2.0f * grain_blend * R;
+    float outG = (1.0f - 2.0f * grain_blend) * (G * G) + 2.0f * grain_blend * G;
+    float outB = (1.0f - 2.0f * grain_blend) * (B * B) + 2.0f * grain_blend * B;
+    
+    // Debug modes
+    if (params.showMask == 1) {
+        dst[di] = grain_blend;
+        dst[di+1] = grain_blend;
+        dst[di+2] = grain_blend;
+        dst[di+3] = A;
+        return;
+    }
+    if (params.showMask == 2) {
+        dst[di] = grain + 0.5f;
+        dst[di+1] = grain + 0.5f;
+        dst[di+2] = grain + 0.5f;
+        dst[di+3] = A;
+        return;
+    }
+    if (params.showMask == 3) {
+        dst[di] = mask;
+        dst[di+1] = mask;
+        dst[di+2] = mask;
+        dst[di+3] = A;
+        return;
+    }
+    if (params.showMask == 4) {
+        dst[di] = R;
+        dst[di+1] = G;
+        dst[di+2] = B;
+        dst[di+3] = A;
+        return;
+    }
+    if (params.showMask == 5) {
+        float testGrain = 0.6f;
+        dst[di] = (1.0f - 2.0f * testGrain) * (R * R) + 2.0f * testGrain * R;
+        dst[di+1] = (1.0f - 2.0f * testGrain) * (G * G) + 2.0f * testGrain * G;
+        dst[di+2] = (1.0f - 2.0f * testGrain) * (B * B) + 2.0f * testGrain * B;
+        dst[di+3] = A;
+        return;
     }
 
-    dst[di]   = blend_soft_light(r_resp, nrn);
-    dst[di+1] = blend_soft_light(g_resp, ngn);
-    dst[di+2] = blend_soft_light(b_resp, nbn);
+    dst[di]   = outR;
+    dst[di+1] = outG;
+    dst[di+2] = outB;
     dst[di+3] = A;
 }
 )MSL";
@@ -448,6 +420,24 @@ int RunMetalKernel(void *p_CmdQueue, const void *p_Src, void *p_Dst,
   @autoreleasepool {
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)p_CmdQueue;
     id<MTLDevice> device = queue.device;
+
+    // LOG: Print key parameters to diagnose grain visibility
+    static int logCounter = 0;
+    if (logCounter++ % 60 == 0) { // Log once per second at 60fps
+      NSLog(@"[ArriGrain] === PARAMETER DUMP ===");
+      NSLog(@"[ArriGrain] width=%d height=%d", p_Params->width, p_Params->height);
+      NSLog(@"[ArriGrain] globalAmt=%.3f grainDepth=%.3f grainSoftness=%.3f",
+            p_Params->globalAmt, p_Params->grainDepth, p_Params->grainSoftness);
+      NSLog(@"[ArriGrain] mixFine=%.3f mixMedium=%.3f mixCoarse=%.3f",
+            p_Params->mixFine, p_Params->mixMedium, p_Params->mixCoarse);
+      NSLog(@"[ArriGrain] biasR=%.3f biasG=%.3f biasB=%.3f",
+            p_Params->biasR, p_Params->biasG, p_Params->biasB);
+      NSLog(@"[ArriGrain] shadowResponse=%.3f highlightResponse=%.3f",
+            p_Params->shadowResponse, p_Params->highlightResponse);
+      NSLog(@"[ArriGrain] format_scale=%.3f contrast_mod=%.3f bw_mode=%.3f",
+            p_Params->format_scale, p_Params->contrast_mod, p_Params->bw_mode);
+      NSLog(@"[ArriGrain] showMask=%d", p_Params->showMask);
+    }
 
     if (!ensurePipeline(device))
       return 2; // kOfxStatFailed

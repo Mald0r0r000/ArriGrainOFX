@@ -281,8 +281,9 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle fx) {
             "grpResponse");
 
   // Debug
-  defBool(ps, P_SHOWMASK, "Show Driving Mask", false,
-          "Visualise luminance response", "grpDebug");
+  const char *showMaskOpts[] = {"Off", "Grain with Mask", "Raw Grain Signal", "Mask Only", "Pass Through", "Constant Grain Test"};
+  defChoice(ps, P_SHOWMASK, "Debug Mode", 0, showMaskOpts, 6,
+          "Visualize grain signal or mask intensity", "grpDebug");
 
   return kOfxStatOK;
 }
