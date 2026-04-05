@@ -52,13 +52,14 @@
 #define PLUGIN_ID "com.arristyle.grain.metal"
 #define PLUGIN_NAME "Arri Style Grain"
 #define PLUGIN_GROUP "Film Emulation"
-#define PLUGIN_VMAJ 1
+#define PLUGIN_VMAJ 2
 #define PLUGIN_VMIN 0
 
 // ---------------------------------------------------------------------------
 // Parameter name constants
 // ---------------------------------------------------------------------------
 #define P_FORMAT "formatSelect"
+#define P_STOCK "stockSelect"
 #define P_PROCESS "processSelect"
 #define P_RESSCALE "resScale"
 #define P_SPEED "animSpeed"
@@ -73,7 +74,7 @@
 #define P_BIAS_B "biasB"
 #define P_SHADOW "shadowResponse"
 #define P_HIGHLIGHT "highlightResponse"
-#define P_SHOWMASK "showMask"
+#define P_SHOWMASK "debugModeView"
 
 // ---------------------------------------------------------------------------
 // Globals: host + suites
@@ -87,7 +88,7 @@ static OfxImageEffectSuiteV1 *gEffSuite = nullptr;
 // Instance data (parameter handles cached per instance)
 // ---------------------------------------------------------------------------
 struct InstData {
-  OfxParamHandle format, process;
+  OfxParamHandle format, stock, process;
   OfxParamHandle resScale, speed;
   OfxParamHandle fine, medium, coarse;
   OfxParamHandle amount, depth, softness;
@@ -234,6 +235,14 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle fx) {
   defChoice(ps, P_FORMAT, "Format", 2, formatOpts, 4,
             "Physical film format (grain size relative to frame)", "grpFilm");
 
+  const char *stockOpts[] = {
+      "Kodak Vision3 250D (5207)", "Kodak Vision3 500T (5219)",
+      "Kodak Vision3 200T (5213)", "Fuji Eterna 500T (8673)",
+      "Kodak Double-X B&W (5222)"};
+  defChoice(ps, P_STOCK, "Emulsion", 0, stockOpts, 5,
+            "Film emulsion type (H&D curves, cross-talk, grain response)",
+            "grpFilm");
+
   const char *processOpts[] = {"Classic", "Bleach Bypass", "Reversal"};
   defChoice(ps, P_PROCESS, "Process", 0, processOpts, 3,
             "Photochemical process (grain contrast character)", "grpFilm");
@@ -272,9 +281,11 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle fx) {
             "grpResponse");
 
   // Debug
-  const char *showMaskOpts[] = {"Off", "Grain with Mask", "Raw Grain Signal", "Mask Only", "Pass Through", "Constant Grain Test"};
-  defChoice(ps, P_SHOWMASK, "Debug Mode", 0, showMaskOpts, 6,
-          "Visualize grain signal or mask intensity", "grpDebug");
+  const char *maskOpts[] = {
+      "Off", "Density Mask", "Grain Only",
+      "Amplitude R", "Pass Through", "Test Pattern (Red)"};
+  defChoice(ps, P_SHOWMASK, "Debug View", 0, maskOpts, 6,
+            "Visualise grain internals", "grpDebug");
 
   return kOfxStatOK;
 }
@@ -285,6 +296,7 @@ static OfxStatus actionCreateInstance(OfxImageEffectHandle fx) {
   InstData *d = new InstData;
 
   gParamSuite->paramGetHandle(ps, P_FORMAT, &d->format, nullptr);
+  gParamSuite->paramGetHandle(ps, P_STOCK, &d->stock, nullptr);
   gParamSuite->paramGetHandle(ps, P_PROCESS, &d->process, nullptr);
   gParamSuite->paramGetHandle(ps, P_RESSCALE, &d->resScale, nullptr);
   gParamSuite->paramGetHandle(ps, P_SPEED, &d->speed, nullptr);
@@ -373,7 +385,7 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
 
   // Fill GrainParams using bounds (to process the entire frame DaVinci Resolve
   // allocates)
-  GrainParams gp;
+  GrainParams gp = {}; // Zero-initialize to prevent garbage memory
   gp.width = srcBounds[2] - srcBounds[0];
   gp.height = srcBounds[3] - srcBounds[1];
   gp.boundsX = srcBounds[0];
@@ -382,42 +394,54 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
   gp.srcRowBytes = srcRB;
   gp.dstRowBytes = dstRB;
 
-  // Read parameter values at current time
-  int iv;
-  double dv;
+  // Read parameter values at current time (Always reset dv/iv to prevent stale carryover if fetch fails)
+  int iv = 0;
+  double dv = 0.0;
 
-  gParamSuite->paramGetValueAtTime(d->format, time, &iv);
-  gp.formatSelect = iv;
-  gParamSuite->paramGetValueAtTime(d->process, time, &iv);
-  gp.processSelect = iv;
-  gParamSuite->paramGetValueAtTime(d->resScale, time, &dv);
-  gp.resScale = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->speed, time, &dv);
-  gp.animSpeed = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->fine, time, &dv);
-  gp.mixFine = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->medium, time, &dv);
-  gp.mixMedium = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->coarse, time, &dv);
-  gp.mixCoarse = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->amount, time, &dv);
-  gp.globalAmt = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->depth, time, &dv);
-  gp.grainDepth = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->softness, time, &dv);
-  gp.grainSoftness = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->biasR, time, &dv);
-  gp.biasR = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->biasG, time, &dv);
-  gp.biasG = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->biasB, time, &dv);
-  gp.biasB = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->shadow, time, &dv);
-  gp.shadowResponse = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->highlight, time, &dv);
-  gp.highlightResponse = (float)dv;
-  gParamSuite->paramGetValueAtTime(d->showMask, time, &iv);
-  gp.showMask = iv;
+  iv = 2; gParamSuite->paramGetValueAtTime(d->format, time, &iv); gp.formatSelect = iv;
+  iv = 0; gParamSuite->paramGetValueAtTime(d->stock, time, &iv); gp.stockSelect = iv;
+  iv = 0; gParamSuite->paramGetValueAtTime(d->process, time, &iv); gp.processSelect = iv;
+  
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->resScale, time, &dv); gp.resScale = (float)dv;
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->speed, time, &dv); gp.animSpeed = (float)dv;
+  dv = 0.5; gParamSuite->paramGetValueAtTime(d->fine, time, &dv); gp.mixFine = (float)dv;
+  dv = 0.6; gParamSuite->paramGetValueAtTime(d->medium, time, &dv); gp.mixMedium = (float)dv;
+  dv = 0.4; gParamSuite->paramGetValueAtTime(d->coarse, time, &dv); gp.mixCoarse = (float)dv;
+  dv = 0.4; gParamSuite->paramGetValueAtTime(d->amount, time, &dv); gp.globalAmt = (float)dv;
+  dv = 0.4; gParamSuite->paramGetValueAtTime(d->depth, time, &dv); gp.grainDepth = (float)dv;
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->softness, time, &dv); gp.grainSoftness = (float)dv;
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->biasR, time, &dv); gp.biasR = (float)dv;
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->biasG, time, &dv); gp.biasG = (float)dv;
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->biasB, time, &dv); gp.biasB = (float)dv;
+  dv = 1.0; gParamSuite->paramGetValueAtTime(d->shadow, time, &dv); gp.shadowResponse = (float)dv;
+  dv = 0.8; gParamSuite->paramGetValueAtTime(d->highlight, time, &dv); gp.highlightResponse = (float)dv;
+  
+  iv = 0; gParamSuite->paramGetValueAtTime(d->showMask, time, &iv); gp.showMask = iv;
+
+  // Setup grain science data specific to the film format
+  // Smaller formats have larger, more apparent grain
+  static const float grainSize_format_data[4][3] = {
+      {2.0f, 1.8f, 2.2f},   // 8mm  — very coarse grain
+      {1.2f, 1.1f, 1.3f},   // 16mm — coarse grain
+      {0.6f, 0.55f, 0.65f}, // 35mm — medium grain
+      {0.25f, 0.22f, 0.28f} // 70mm/IMAX — very fine grain
+  };
+  // grainCorr per film format (physical: smaller format = more correlated grain)
+  static const float grainCorr_format_data[4][2] = {
+      {0.30f, 0.25f},  // 8mm  — coarse, more correlated
+      {0.25f, 0.20f},  // 16mm
+      {0.15f, 0.12f},  // 35mm — finer, more independent
+      {0.08f, 0.06f},  // 70mm/IMAX — quasi-independent
+  };
+
+  int fmt = gp.formatSelect;
+  if (fmt < 0 || fmt > 3) fmt = 2;
+
+  for (int i = 0; i < 3; ++i) {
+    gp.grainSize[i] = grainSize_format_data[fmt][i];
+  }
+  gp.grainCorr[0] = grainCorr_format_data[fmt][0];
+  gp.grainCorr[1] = grainCorr_format_data[fmt][1];
 
   // --- Precalculate Performance Parameters ---
   float format_scale = 1.0f;
@@ -431,8 +455,6 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
   if (gp.processSelect == 1) contrast_mod = 1.5f;
   else if (gp.processSelect == 2) contrast_mod = 1.2f;
   gp.contrast_mod = contrast_mod;
-
-  gp.bw_mode = 0.0f;
 
   // Dispatch Metal
   int result = RunMetalKernel(cmdQ, srcPtr, dstPtr, &gp);

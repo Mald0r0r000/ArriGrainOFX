@@ -21,6 +21,7 @@ typedef struct {
 
   // --- Parameters ---
   int formatSelect;
+  int stockSelect;
   int processSelect;
   float resScale;
   float animSpeed;
@@ -37,18 +38,13 @@ typedef struct {
   float highlightResponse;
   int showMask;
 
-  // --- Film Emulation Science ---
-  float toe[3];
-  float gamma[3];
-  float shoulder[3];
-  float crosstalk[9];
+  // --- Film Grain Science ---
   float grainSize[3];
   float grainCorr[2]; // RG, GB correlation
 
   // --- Precalculated Performance Parameters ---
   float format_scale;
   float contrast_mod;
-  float bw_mode;
 } GrainParams;
 
 // Returns 0 on success (kOfxStatOK)
