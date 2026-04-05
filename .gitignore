@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+*.ofx
+ArriGrainOFX.ofx.bundle/
+
+# macOS
+.DS_Store
+
+# Release archives
+*.zip
+release/
