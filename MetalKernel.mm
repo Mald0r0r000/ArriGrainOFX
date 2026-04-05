@@ -29,7 +29,6 @@ struct GrainParams {
     int   srcRowBytes;
     int   dstRowBytes;
     int   formatSelect;
-    int   stockSelect;
     int   processSelect;
     float resScale;
     float animSpeed;

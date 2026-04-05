@@ -59,7 +59,6 @@
 // Parameter name constants
 // ---------------------------------------------------------------------------
 #define P_FORMAT "formatSelect"
-#define P_STOCK "stockSelect"
 #define P_PROCESS "processSelect"
 #define P_RESSCALE "resScale"
 #define P_SPEED "animSpeed"
@@ -88,7 +87,7 @@ static OfxImageEffectSuiteV1 *gEffSuite = nullptr;
 // Instance data (parameter handles cached per instance)
 // ---------------------------------------------------------------------------
 struct InstData {
-  OfxParamHandle format, stock, process;
+  OfxParamHandle format, process;
   OfxParamHandle resScale, speed;
   OfxParamHandle fine, medium, coarse;
   OfxParamHandle amount, depth, softness;
@@ -230,18 +229,10 @@ static OfxStatus actionDescribeInContext(OfxImageEffectHandle fx) {
   defGroup(ps, "grpResponse", "Film Response Curve", false);
   defGroup(ps, "grpDebug", "Debug", false);
 
-  // Film Stock — 3 dropdown menus
+  // Film Stock — dropdown menus
   const char *formatOpts[] = {"8mm", "16mm", "35mm", "70mm / IMAX"};
   defChoice(ps, P_FORMAT, "Format", 2, formatOpts, 4,
             "Physical film format (grain size relative to frame)", "grpFilm");
-
-  const char *stockOpts[] = {
-      "Kodak Vision3 250D (5207)", "Kodak Vision3 500T (5219)",
-      "Kodak Vision3 200T (5213)", "Fuji Eterna 500T (8673)",
-      "Kodak Double-X B&W (5222)"};
-  defChoice(ps, P_STOCK, "Emulsion", 0, stockOpts, 5,
-            "Film emulsion type (H&D curves, cross-talk, grain response)",
-            "grpFilm");
 
   const char *processOpts[] = {"Classic", "Bleach Bypass", "Reversal"};
   defChoice(ps, P_PROCESS, "Process", 0, processOpts, 3,
@@ -296,7 +287,6 @@ static OfxStatus actionCreateInstance(OfxImageEffectHandle fx) {
   InstData *d = new InstData;
 
   gParamSuite->paramGetHandle(ps, P_FORMAT, &d->format, nullptr);
-  gParamSuite->paramGetHandle(ps, P_STOCK, &d->stock, nullptr);
   gParamSuite->paramGetHandle(ps, P_PROCESS, &d->process, nullptr);
   gParamSuite->paramGetHandle(ps, P_RESSCALE, &d->resScale, nullptr);
   gParamSuite->paramGetHandle(ps, P_SPEED, &d->speed, nullptr);
@@ -399,7 +389,6 @@ static OfxStatus actionRender(OfxImageEffectHandle fx,
   double dv = 0.0;
 
   iv = 2; gParamSuite->paramGetValueAtTime(d->format, time, &iv); gp.formatSelect = iv;
-  iv = 0; gParamSuite->paramGetValueAtTime(d->stock, time, &iv); gp.stockSelect = iv;
   iv = 0; gParamSuite->paramGetValueAtTime(d->process, time, &iv); gp.processSelect = iv;
   
   dv = 1.0; gParamSuite->paramGetValueAtTime(d->resScale, time, &dv); gp.resScale = (float)dv;
